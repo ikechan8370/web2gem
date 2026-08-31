@@ -1,0 +1,126 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.3/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"files": {
+		"includes": [
+			"src/**/*.ts",
+			"src/**/*.tsx",
+			"scripts/**/*.mjs",
+			"tests/**/*.js",
+			"tests/**/*.mjs",
+			"tests/**/*.ts",
+			"tests/**/*.tsx",
+			"src/**/*.css",
+			"*.json",
+			"*.jsonc",
+			"*.mjs"
+		]
+	},
+	"javascript": {
+		"globals": ["FixedLengthStream"]
+	},
+	"formatter": {
+		"enabled": true,
+		"lineEnding": "lf"
+	},
+	"overrides": [
+		{
+			"includes": ["tests/**/*.ts", "tests/**/*.tsx"],
+			"linter": {
+				"rules": {
+					"suspicious": {
+						"noEvolvingTypes": "off",
+						"noImplicitAnyLet": "off"
+					}
+				}
+			}
+		},
+		{
+			"includes": ["src/admin-ui/**"],
+			"linter": {
+				"rules": {
+					"correctness": {
+						"noSolidDestructuredProps": "off"
+					},
+					"style": {
+						"noDescendingSpecificity": "off"
+					}
+				}
+			}
+		},
+		{
+			"includes": [
+				"src/index.ts",
+				"src/harness-exports.ts",
+				"vitest.config.mjs"
+			],
+			"linter": {
+				"rules": {
+					"style": {
+						"noDefaultExport": "off"
+					}
+				}
+			}
+		}
+	],
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"preset": "recommended",
+			"a11y": {
+				"preset": "all"
+			},
+			"correctness": {
+				"preset": "all",
+				"noNodejsModules": "off",
+				"noProcessGlobal": "off",
+				"noUnresolvedImports": "off",
+				"useImportExtensions": "off",
+				"useQwikValidLexicalScope": "off",
+				"useUniqueElementIds": "off"
+			},
+			"security": {
+				"preset": "all"
+			},
+			"performance": {
+				"recommended": true
+			},
+			"complexity": {
+				"recommended": true,
+				"noUselessStringConcat": "info"
+			},
+			"style": {
+				"recommended": true,
+				"noCommonJs": "warn",
+				"noDefaultExport": "warn",
+				"noEnum": "warn",
+				"noNamespace": "warn",
+				"noNestedTernary": "info",
+				"noParameterAssign": "warn",
+				"useAsConstAssertion": "info",
+				"useConsistentArrayType": "info",
+				"useThrowNewError": "info",
+				"useThrowOnlyError": "warn"
+			},
+			"suspicious": {
+				"preset": "all",
+				"noAlert": "off",
+				"noBitwiseOperators": "off",
+				"noControlCharactersInRegex": "off",
+				"noDeprecatedImports": "off",
+				"noEmptyBlockStatements": "off",
+				"noEqualsToNull": "off",
+				"noMisplacedAssertion": "off",
+				"noUnknownAttribute": "off",
+				"noUnnecessaryConditions": "off",
+				"useArraySortCompare": "off",
+				"useAwait": "off",
+				"useStaticResponseMethods": "off"
+			}
+		}
+	}
+}

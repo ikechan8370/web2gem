@@ -1,0 +1,522 @@
+import {
+	droppedAttachmentNote,
+	recognizedFileRefKey,
+} from "../attachments/plan";
+import type { AttachmentPlan } from "../attachments/types";
+import type { RuntimeConfig } from "../config";
+import {
+	attachmentPlanFromMessages,
+	openAIAttachmentPlanFromRequest,
+} from "../promptcompat/attachment-inputs";
+import {
+	type InternalMessage,
+	latestUserInputText,
+} from "../promptcompat/message-model";
+import {
+	appendStructuredOutputInstructionToPrepared,
+	appendTextToPreparedWithTokens,
+	buildOpenAIHistoryTranscript,
+	messagesToPrompt,
+	type PromptToolContext,
+	structuredInstruction,
+	withGeminiNativeHiddenToolsPromptForPrepared,
+	withGeminiNativeHiddenToolsPromptWithTokens,
+} from "../promptcompat/prompt";
+import {
+	buildTextWithTokens,
+	type PreparedTokenText,
+} from "../promptcompat/token-accounting";
+import { logStage } from "../shared/logging";
+import {
+	createPromptByteLengthSniffer,
+	type PromptByteLengthBounded,
+} from "../shared/text-metrics";
+import type { UnknownRecord } from "../shared/types";
+import type { ToolChoicePolicy } from "../toolcall/policy";
+import { buildToolChoiceInstructionFromPolicy } from "../toolcall/policy";
+import type { ToolBundle } from "../toolcall/tool-bundle";
+import {
+	type ContextFilePromptByteCheck,
+	contextFilePromptByteCheck,
+	contextFileThreshold,
+	contextFileUploadUnavailableReason,
+	oversizedInlineContextFailure,
+	prepareContextFiles,
+	shouldConsiderContextFiles,
+} from "./context-files";
+import type { CompletionProvider } from "./ports";
+import type {
+	AttachmentResolutionResult,
+	ContextFileFailure,
+	ContextFileResult,
+	FileRef,
+	GeminiContextPrepareResult,
+	PromptMetadata,
+	ToolDef,
+} from "./types";
+import { hasCompletionError } from "./types";
+
+// --- Dialect entries (OpenAI / Google) ---
+
+export type FileRefGroup = "context" | "existing" | "generic" | "image";
+
+const OPENAI_FILE_REF_ORDER: readonly FileRefGroup[] = [
+	"context",
+	"existing",
+	"generic",
+	"image",
+];
+const GOOGLE_FILE_REF_ORDER: readonly FileRefGroup[] = [
+	"image",
+	"context",
+	"generic",
+];
+
+export async function prepareOpenAIGeminiContext(
+	cfg: RuntimeConfig,
+	provider: CompletionProvider,
+	req: UnknownRecord,
+	messages: readonly InternalMessage[],
+	tools: ToolBundle | null | undefined,
+	promptToolChoice: unknown,
+	toolPolicy: ToolChoicePolicy | null | undefined,
+	structured: unknown,
+): Promise<GeminiContextPrepareResult> {
+	const bundle = tools || null;
+	const toolChoiceInstruction =
+		buildToolChoiceInstructionFromPolicy(toolPolicy);
+	const toolContext: PromptToolContext | null = bundle
+		? {
+				bundle,
+				choiceInstruction: toolChoiceInstruction,
+				include: promptToolChoice !== "none",
+			}
+		: null;
+	return prepareGeminiContext({
+		cfg,
+		provider,
+		messages,
+		toolContext,
+		attachmentPlan: openAIAttachmentPlanFromRequest(req, messages),
+		structured,
+		fileRefOrder: OPENAI_FILE_REF_ORDER,
+	});
+}
+
+export async function prepareGoogleGeminiContext(
+	cfg: RuntimeConfig,
+	provider: CompletionProvider,
+	messages: readonly InternalMessage[],
+	hasTools: boolean,
+	toolBundle?: ToolBundle | null,
+	toolChoiceInstructionOverride?: string,
+): Promise<GeminiContextPrepareResult> {
+	const bundle = hasTools && toolBundle ? toolBundle : null;
+	const toolChoiceInstruction = toolChoiceInstructionOverride ?? "";
+	const toolContext: PromptToolContext | null = bundle
+		? { bundle, choiceInstruction: toolChoiceInstruction, include: true }
+		: null;
+	return prepareGeminiContext({
+		cfg,
+		provider,
+		messages,
+		toolContext,
+		attachmentPlan: attachmentPlanFromMessages(messages),
+		structured: null,
+		fileRefOrder: GOOGLE_FILE_REF_ORDER,
+	});
+}
+
+type PrepareGeminiContextParams = {
+	cfg: RuntimeConfig;
+	provider: CompletionProvider;
+	messages: readonly InternalMessage[];
+	toolContext: PromptToolContext | null;
+	attachmentPlan: ReturnType<typeof attachmentPlanFromMessages>;
+	structured: unknown;
+	fileRefOrder: readonly FileRefGroup[];
+};
+
+async function prepareGeminiContext(
+	params: PrepareGeminiContextParams,
+): Promise<GeminiContextPrepareResult> {
+	const promptResult = messagesToPrompt(
+		params.messages,
+		params.toolContext,
+		contextFileThreshold(params.cfg),
+	);
+	const bundle = params.toolContext?.bundle ?? null;
+	const toolDefs = bundle
+		? (bundle.promptArtifact.defs as readonly ToolDef[])
+		: [];
+	const prompt = promptResult.text;
+	return preparePromptWithAttachments({
+		cfg: params.cfg,
+		provider: params.provider,
+		basePrompt: prompt,
+		basePromptPrepared: promptResultToPrepared(promptResult, prompt),
+		basePromptByteCheck: contextFilePromptByteCheckFromBounded(
+			params.cfg,
+			promptResult.byteCheck,
+		),
+		hiddenPromptInsertOffset:
+			promptResult.hiddenPromptInsertOffset ?? undefined,
+		attachmentPlan: params.attachmentPlan,
+		toolDefs,
+		toolPromptSource: bundle,
+		toolChoiceInstruction: params.toolContext?.choiceInstruction ?? "",
+		basePromptMetadata: promptResult.metadata,
+		buildHistoryText: () =>
+			buildOpenAIHistoryTranscript(params.messages, "message.txt"),
+		getLatestInputText: () =>
+			promptResult.latestInputText || latestUserInputText(params.messages),
+		structured: params.structured,
+		fileRefOrder: params.fileRefOrder,
+	});
+}
+
+// --- Prompt + attachments + context-file orchestration ---
+
+export type PromptWithAttachmentParams = {
+	cfg: RuntimeConfig;
+	provider: CompletionProvider;
+	basePrompt: string;
+	basePromptPrepared?: PreparedTokenText | null;
+	basePromptByteCheck?: ContextFilePromptByteCheck | null;
+	hiddenPromptInsertOffset?: number | undefined;
+	attachmentPlan: AttachmentPlan;
+	toolDefs: readonly ToolDef[];
+	toolPromptSource?: ToolBundle | null;
+	toolChoiceInstruction: string;
+	basePromptMetadata: PromptMetadata;
+	buildHistoryText: () => string;
+	getLatestInputText: () => unknown;
+	structured: unknown;
+	fileRefOrder: readonly FileRefGroup[];
+};
+
+export async function preparePromptWithAttachments(
+	params: PromptWithAttachmentParams,
+): Promise<GeminiContextPrepareResult> {
+	const plannedDroppedNote = droppedAttachmentNote(
+		params.attachmentPlan.dropped,
+	);
+	const preUploadPromptDecision = preUploadPromptDecisionForPlannedDrops(
+		params,
+		plannedDroppedNote,
+	);
+	if (preUploadPromptDecision.promptByteCheck.exceeded) {
+		const contextUnavailableReason = contextFileUploadUnavailableReason(
+			params.cfg,
+			params.provider.uploadTextFile,
+		);
+		if (contextUnavailableReason) {
+			return {
+				error: oversizedInlineContextFailure(
+					params.cfg,
+					preUploadPromptDecision.contextPromptText,
+					preUploadPromptDecision.promptByteCheck,
+					contextUnavailableReason,
+				),
+			};
+		}
+	}
+
+	let contextFiles: ContextFileResult | null = null;
+	if (preUploadPromptDecision.considerContextFiles) {
+		const prepared = await prepareContextFilesForDecision(
+			params,
+			preUploadPromptDecision,
+		);
+		if (prepared && hasCompletionError(prepared))
+			return { error: prepared.error };
+		contextFiles = prepared;
+	}
+
+	let attachmentResult: AttachmentResolutionResult;
+	try {
+		attachmentResult = await params.provider.resolveAttachments(
+			params.attachmentPlan,
+		);
+	} catch (error) {
+		return {
+			error: error instanceof Error ? error : new Error(String(error)),
+		};
+	}
+	const attachmentPromptText =
+		(attachmentResult.promptText || "") + (attachmentResult.droppedNote || "");
+	const preparedBase = params.basePromptPrepared
+		? appendTextToPreparedWithTokens(params.basePromptPrepared, [
+				attachmentPromptText,
+			])
+		: buildTextWithTokens([params.basePrompt, attachmentPromptText]);
+	const inlineHiddenToolsPrompt = withGeminiNativeHiddenToolsPromptForPrepared(
+		preparedBase,
+		true,
+		params.hiddenPromptInsertOffset,
+	);
+	const inlinePreparedPrompt = prepareStructuredPrompt(
+		inlineHiddenToolsPrompt,
+		params.structured,
+	);
+	let contextPromptText = preUploadPromptDecision.contextPromptText;
+	let promptCheckSource = preUploadPromptDecision.promptCheckSource;
+	let promptByteCheck = preUploadPromptDecision.promptByteCheck;
+	if (!contextFiles) {
+		contextPromptText = inlinePreparedPrompt.text;
+		promptCheckSource = "inline";
+		promptByteCheck = contextFilePromptByteCheck(params.cfg, contextPromptText);
+		const considerContextFiles = shouldConsiderContextFiles(
+			params.cfg,
+			contextPromptText,
+			promptByteCheck,
+		);
+
+		const contextUnavailableReason = promptByteCheck.exceeded
+			? contextFileUploadUnavailableReason(
+					params.cfg,
+					params.provider.uploadTextFile,
+				)
+			: "";
+		if (promptByteCheck.exceeded && contextUnavailableReason) {
+			return {
+				error: oversizedInlineContextFailure(
+					params.cfg,
+					contextPromptText,
+					promptByteCheck,
+					contextUnavailableReason,
+				),
+			};
+		}
+
+		if (considerContextFiles) {
+			const promptDecision: PromptDecision = {
+				contextPromptText,
+				promptCheckSource,
+				promptByteCheck,
+				considerContextFiles,
+			};
+			const prepared = await prepareContextFilesForDecision(
+				params,
+				promptDecision,
+			);
+			if (prepared && hasCompletionError(prepared))
+				return { error: prepared.error };
+			contextFiles = prepared;
+		}
+	}
+	if (params.cfg.log_requests) {
+		const contextPrepareStageFields: Record<string, unknown> = {
+			promptCheck: promptCheckSource,
+			promptBytes: promptByteCheck.exact
+				? promptByteCheck.bytes
+				: `>${promptByteCheck.thresholdBytes}`,
+			threshold: promptByteCheck.thresholdBytes,
+			exceeded: promptByteCheck.exceeded,
+			contextFiles: !!contextFiles,
+			contextRefs: contextFiles ? contextFiles.fileRefs.length : 0,
+			genericFileRefs: attachmentResult.genericFileRefs
+				? attachmentResult.genericFileRefs.length
+				: 0,
+			imageRefs: attachmentResult.imageFileRefs
+				? attachmentResult.imageFileRefs.length
+				: 0,
+			droppedAttachments: attachmentResult.usage.droppedFiles,
+			dedupedAttachments: attachmentResult.usage.dedupedFiles,
+			toolDefs: params.toolDefs.length,
+		};
+		contextPrepareStageFields.basePromptHasToolBlock =
+			params.basePromptMetadata.hasToolPrompt;
+		contextPrepareStageFields.basePromptHasToolNames =
+			params.basePromptMetadata.hasToolPrompt && params.toolDefs.length > 0;
+		logStage(params.cfg, "context_prepare", contextPrepareStageFields);
+	}
+
+	const contextFileRefs = contextFiles ? contextFiles.fileRefs : null;
+	const fileRefGroups: Record<FileRefGroup, FileRef[] | null> = {
+		context: contextFileRefs,
+		existing: params.attachmentPlan.existingFileRefs as FileRef[] | null,
+		generic: attachmentResult.genericFileRefs as FileRef[] | null,
+		image: attachmentResult.imageFileRefs as FileRef[] | null,
+	};
+	const fileRefs = attachmentResult.supportsFileRefs
+		? mergeFileRefs(...params.fileRefOrder.map((group) => fileRefGroups[group]))
+		: null;
+	const livePreparedPrompt = contextFiles
+		? prepareStructuredPrompt(
+				buildTextWithTokens([contextFiles.prompt, attachmentPromptText]),
+				params.structured,
+			)
+		: inlinePreparedPrompt;
+	const usagePreparedPrompt = contextFiles
+		? prepareStructuredPrompt(
+				appendTextToPreparedWithTokens(
+					{ text: "", tokens: 0, counts: contextFiles.promptTokenCounts },
+					[attachmentPromptText],
+					false,
+				),
+				params.structured,
+				false,
+			)
+		: livePreparedPrompt;
+	const attachmentFileRefTokens = attachmentFileRefTokenEstimate(
+		attachmentResult.usage,
+	);
+
+	return {
+		toolDefs: params.toolDefs,
+		toolChoiceInstruction: params.toolChoiceInstruction,
+		prompt: livePreparedPrompt.text,
+		promptTokens: usagePreparedPrompt.tokens + attachmentFileRefTokens,
+		fileRefs,
+		contextFiles,
+		promptMetadata: contextFiles
+			? { hasToolPrompt: false, hasToolInstructions: true }
+			: params.basePromptMetadata,
+	};
+}
+
+/** Ordered de-duplicating merge of provider file-ref groups. */
+function mergeFileRefs<T>(
+	...groups: Array<readonly T[] | null | undefined>
+): T[] | null {
+	const out: T[] = [];
+	const seen = new Set<unknown>();
+	for (const group of groups) {
+		if (!Array.isArray(group)) continue;
+		for (const ref of group) {
+			if (!ref) continue;
+			const key = recognizedFileRefKey(ref) || JSON.stringify(ref);
+			if (!key || seen.has(key)) continue;
+			seen.add(key);
+			out.push(ref);
+		}
+	}
+	return out.length ? out : null;
+}
+
+function attachmentFileRefTokenEstimate(
+	usage: { fileRefBytes?: unknown; uploadedBytes?: unknown } | null | undefined,
+): number {
+	if (!usage) return 0;
+	const bytes = Number(usage.fileRefBytes ?? usage.uploadedBytes);
+	if (!Number.isFinite(bytes) || bytes <= 0) return 0;
+	return Math.floor(bytes / 3);
+}
+
+type PromptDecision = {
+	contextPromptText: string;
+	promptCheckSource: string;
+	promptByteCheck: ContextFilePromptByteCheck;
+	considerContextFiles: boolean;
+};
+
+function preUploadPromptDecisionForPlannedDrops(
+	params: PromptWithAttachmentParams,
+	droppedNote: string,
+): PromptDecision {
+	const contextPromptText = params.basePrompt + droppedNote;
+	let promptCheckSource = "base";
+	let promptByteCheck = droppedNote
+		? contextFilePromptByteCheck(params.cfg, contextPromptText)
+		: params.basePromptByteCheck ||
+			contextFilePromptByteCheck(params.cfg, contextPromptText);
+	let considerContextFiles = shouldConsiderContextFiles(
+		params.cfg,
+		contextPromptText,
+		promptByteCheck,
+	);
+	if (!promptByteCheck.exceeded) {
+		promptByteCheck = inlinePreparedPromptByteCheck(
+			params.cfg,
+			contextPromptText,
+			params.structured,
+			params.hiddenPromptInsertOffset,
+		);
+		promptCheckSource = "inline_estimate";
+		considerContextFiles = shouldConsiderContextFiles(
+			params.cfg,
+			contextPromptText,
+			promptByteCheck,
+		);
+	}
+	return {
+		contextPromptText,
+		promptCheckSource,
+		promptByteCheck,
+		considerContextFiles,
+	};
+}
+
+async function prepareContextFilesForDecision(
+	params: PromptWithAttachmentParams,
+	decision: PromptDecision,
+): Promise<ContextFileResult | ContextFileFailure | null> {
+	const historyText = params.buildHistoryText();
+	const latestInputText = params.getLatestInputText();
+	return prepareContextFiles(
+		params.cfg,
+		historyText,
+		params.toolDefs,
+		params.toolChoiceInstruction,
+		latestInputText,
+		decision.contextPromptText,
+		params.provider.uploadTextFile,
+		decision.promptByteCheck,
+		params.toolPromptSource ?? null,
+	);
+}
+
+function prepareStructuredPrompt(
+	prompt: PreparedTokenText,
+	structured: unknown,
+	keepText = true,
+): PreparedTokenText {
+	return structured
+		? appendStructuredOutputInstructionToPrepared(prompt, structured, keepText)
+		: prompt;
+}
+
+function inlinePreparedPromptByteCheck(
+	cfg: RuntimeConfig,
+	prompt: string,
+	structured: unknown,
+	hiddenPromptInsertOffset?: number,
+): ContextFilePromptByteCheck {
+	const thresholdBytes = contextFileThreshold(cfg);
+	const sniffer = createPromptByteLengthSniffer(thresholdBytes);
+	const prepared = withGeminiNativeHiddenToolsPromptWithTokens(
+		prompt,
+		true,
+		hiddenPromptInsertOffset,
+	).text;
+	const hasText = !!prepared;
+	if (prepared) sniffer.append(prepared);
+	const instruction = structuredInstruction(structured);
+	if (instruction) {
+		if (hasText) sniffer.append("\n\n");
+		sniffer.append(instruction);
+	}
+	return { ...sniffer.result(), thresholdBytes };
+}
+
+export function promptResultToPrepared(
+	promptResult: Pick<PreparedTokenText, "tokens" | "counts">,
+	text: string,
+): PreparedTokenText {
+	return {
+		text,
+		tokens: promptResult.tokens,
+		counts: promptResult.counts,
+	};
+}
+
+export function contextFilePromptByteCheckFromBounded(
+	cfg: RuntimeConfig,
+	check: PromptByteLengthBounded | null | undefined,
+): ContextFilePromptByteCheck | null {
+	if (!check) return null;
+	const thresholdBytes = contextFileThreshold(cfg);
+	if (check.maxBytes !== thresholdBytes) return null;
+	return { ...check, thresholdBytes };
+}

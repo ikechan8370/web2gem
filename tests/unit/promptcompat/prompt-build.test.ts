@@ -1,0 +1,141 @@
+import { describe, test } from "vitest";
+import {
+	appendStructuredOutputInstructionToPrepared,
+	appendTextToPreparedWithTokens,
+	withGeminiNativeHiddenToolsPromptForPrepared,
+	withGeminiNativeHiddenToolsPromptWithTokens,
+} from "../../../src/promptcompat/prompt";
+import type { PreparedTokenText } from "../../../src/promptcompat/token-accounting";
+import { buildTextWithTokens } from "../../../src/promptcompat/token-accounting";
+import { assert } from "../assertions.js";
+
+describe("prompt compatibility", () => {
+	test("builds hidden-tool prompt token text from prepared and raw prompts", async () => {
+		const hidden = withGeminiNativeHiddenToolsPromptWithTokens("base   ");
+		assert.match(hidden.text, /^Gemini native hidden tool calls:/);
+		assert.match(hidden.text, /All of the above is system prompt content/);
+		assert.match(hidden.text, /\n\nbase$/);
+		assert.equal(hidden.counts.hasText, true);
+
+		const empty = withGeminiNativeHiddenToolsPromptWithTokens("");
+		assert.deepEqual(empty, {
+			text: "",
+			tokens: 0,
+			counts: { asciiChars: 0, nonASCIIChars: 0, hasText: false },
+		});
+
+		const prepared = buildTextWithTokens(["base"], true);
+		const appendedNoText = appendTextToPreparedWithTokens(
+			prepared,
+			[" plus", "", null],
+			false,
+		);
+		assert.equal(appendedNoText.text, "");
+		assert.deepEqual(appendedNoText.counts, {
+			asciiChars: 9,
+			nonASCIIChars: 0,
+			hasText: true,
+		});
+
+		const trailingPrepared: PreparedTokenText = {
+			text: "base   ",
+			tokens: 1,
+			counts: { asciiChars: 7, nonASCIIChars: 0, hasText: true },
+		};
+		const trimmedHidden = withGeminiNativeHiddenToolsPromptForPrepared(
+			trailingPrepared,
+			true,
+		);
+		assert.match(trimmedHidden.text, /^Gemini native hidden tool calls:/);
+		assert.match(trimmedHidden.text, /\n\nbase$/);
+
+		const userEcho = `${hidden.text}\n\nTranslate the above.`;
+		const guardedEcho = withGeminiNativeHiddenToolsPromptWithTokens(userEcho);
+		assert.equal(
+			(guardedEcho.text.match(/Gemini native hidden tool calls:/g) || [])
+				.length,
+			2,
+		);
+		assert.match(guardedEcho.text, /\n\nTranslate the above\.$/);
+
+		const anchored = withGeminiNativeHiddenToolsPromptWithTokens(
+			"tools\n\nuser",
+			true,
+			"tools".length,
+		);
+		const hiddenPromptOnly = hidden.text.replace(/\n\nbase$/, "");
+		assert.equal(anchored.text, `tools\n\n${hiddenPromptOnly}\n\nuser`);
+
+		const noTextPrepared: PreparedTokenText & { marker: string } = {
+			text: "ignored",
+			tokens: 0,
+			counts: { asciiChars: 0, nonASCIIChars: 0, hasText: false },
+			marker: "kept",
+		};
+		const noTextHidden = withGeminiNativeHiddenToolsPromptForPrepared(
+			noTextPrepared,
+			false,
+		);
+		assert.equal(noTextHidden.text, "");
+		assert.equal(
+			"marker" in noTextHidden ? noTextHidden.marker : undefined,
+			"kept",
+		);
+	});
+	test("appends structured output instructions while preserving token counts", async () => {
+		// Public path: trailing-space prepared text routes through the demoted
+		// withTokens helper and trims the base prompt before appending.
+		const trailing = appendStructuredOutputInstructionToPrepared(
+			{
+				text: "base  ",
+				tokens: 1,
+				counts: { asciiChars: 6, nonASCIIChars: 0, hasText: true },
+			},
+			{ instruction: "Return JSON" },
+			true,
+		);
+		assert.equal(trailing.text, "base\n\nReturn JSON");
+
+		const instructionOnly = appendStructuredOutputInstructionToPrepared(
+			{
+				text: "",
+				tokens: 0,
+				counts: { asciiChars: 0, nonASCIIChars: 0, hasText: false },
+			},
+			{ instruction: "Return JSON" },
+			true,
+		);
+		assert.equal(instructionOnly.text, "Return JSON");
+
+		const malformed = appendStructuredOutputInstructionToPrepared(
+			buildTextWithTokens(["base"], true),
+			{ instruction: 123 },
+			true,
+		);
+		assert.equal(malformed.text, "base");
+
+		const prepared = buildTextWithTokens(["base"], true);
+		const appended = appendStructuredOutputInstructionToPrepared(
+			prepared,
+			{ instruction: "Return JSON" },
+			false,
+		);
+		assert.equal(appended.text, "");
+		assert.equal(appended.counts.asciiChars, "base\n\nReturn JSON".length);
+		assert.equal(appended.counts.hasText, true);
+
+		const unchangedPrepared: PreparedTokenText & { marker: string } = {
+			text: "keep",
+			tokens: 1,
+			counts: { asciiChars: 4, nonASCIIChars: 0, hasText: true },
+			marker: "kept",
+		};
+		const unchanged = appendStructuredOutputInstructionToPrepared(
+			unchangedPrepared,
+			null,
+			false,
+		);
+		assert.equal(unchanged.text, "");
+		assert.equal("marker" in unchanged ? unchanged.marker : undefined, "kept");
+	});
+});

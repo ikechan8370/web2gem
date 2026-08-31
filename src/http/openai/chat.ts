@@ -1,0 +1,247 @@
+import type { CompletionProvider } from "../../completion/ports";
+import {
+	OPENAI_COMPLETION_DIALECT,
+	prepareCompletion,
+} from "../../completion/prepare";
+import type { RuntimeConfig } from "../../config";
+import { parseOpenAIMessages } from "../../promptcompat/message-model";
+import { tokenEst } from "../../promptcompat/token-accounting";
+import { randHex } from "../../shared/crypto";
+import { nowSec } from "../../shared/logging";
+import { isRecord, type UnknownRecord } from "../../shared/types";
+import { jsonResponse } from "../core/json";
+import { sseResponse } from "../core/sse";
+import {
+	type PreparedOk,
+	preparedLogFields,
+	runPreparedCompletion,
+	type StageLog,
+} from "../generation";
+import {
+	streamOpenAIChatPlain,
+	streamOpenAIChatWithToolSieve,
+} from "./chat-stream";
+import { generateOpenAICompletionFinalize } from "./completion-finalize";
+import { OPENAI_GENERATION_PROTOCOL, openAIErrorResponse } from "./errors";
+import {
+	imageGenerationChatContent,
+	openAIChatUsageFromCompletionTokens,
+	writeOpenAIChatStreamError,
+} from "./format";
+import {
+	imageGenerationMode,
+	runImageGenerationCompletion,
+} from "./image-generation";
+
+// POST /v1/chat/completions
+export async function handleChat(
+	req: UnknownRecord,
+	cfg: RuntimeConfig,
+	provider: CompletionProvider,
+) {
+	const messages = parseOpenAIMessages(req.messages);
+	const imageMode = imageGenerationMode(req);
+	if (imageMode.enabled)
+		return handleImageGenerationChat(
+			req,
+			cfg,
+			provider,
+			imageMode.forced,
+			messages,
+		);
+	return runPreparedCompletion({
+		cfg,
+		provider,
+		stage: "openai_chat",
+		protocol: OPENAI_GENERATION_PROTOCOL,
+		prepare: () =>
+			prepareCompletion(
+				cfg,
+				provider,
+				req,
+				messages,
+				req.model,
+				OPENAI_COMPLETION_DIALECT,
+			),
+		prepareLogFields: (prepared) =>
+			preparedLogFields(prepared, {
+				contextFiles: prepared.contextFiles,
+			}),
+		run: (prepared, stageLog) =>
+			runChatGeneration(req, cfg, provider, prepared, stageLog),
+	});
+}
+
+async function runChatGeneration(
+	req: UnknownRecord,
+	cfg: RuntimeConfig,
+	provider: CompletionProvider,
+	prepared: PreparedOk<Awaited<ReturnType<typeof prepareCompletion>>>,
+	stageLog: StageLog,
+): Promise<Response> {
+	const {
+		rm,
+		structured,
+		bundle,
+		tools,
+		streamMode,
+		toolPolicy,
+		promptToolChoice,
+		prompt,
+		fileRefs,
+		promptTokens,
+	} = prepared;
+
+	const stream = !!req.stream;
+	if (stream && structured) {
+		return openAIErrorResponse(
+			"response_format with stream is not supported by this worker because final JSON cannot be validated while streaming",
+			400,
+			"unsupported_response_format_stream",
+		);
+	}
+	const cid = `chatcmpl-${randHex(12)}`;
+	const streamOptions = isRecord(req.stream_options)
+		? req.stream_options
+		: null;
+	const includeStreamUsage = !!streamOptions?.include_usage;
+
+	if (stream && streamMode.type === "plain") {
+		return sseResponse(
+			async (write, signal) => {
+				const generationStart = stageLog.now();
+				await streamOpenAIChatPlain(write, cfg, {
+					provider,
+					id: cid,
+					model: rm.name,
+					prompt,
+					rm,
+					fileRefs,
+					includeUsage: includeStreamUsage,
+					promptTokens,
+					signal,
+				});
+				stageLog.log("openai_chat_stream_generate", generationStart, {
+					model: rm.name,
+					promptTokens,
+					fileRefs: fileRefs ? fileRefs.length : 0,
+				});
+			},
+			{
+				onError: (write, e) =>
+					writeOpenAIChatStreamError(write, cid, rm.name, e),
+			},
+		);
+	}
+
+	if (stream && streamMode.type === "tool_sieve") {
+		const sieveTools = streamMode.tools;
+		return sseResponse(
+			async (write, signal) => {
+				const generationStart = stageLog.now();
+				await streamOpenAIChatWithToolSieve(write, cfg, {
+					provider,
+					id: cid,
+					model: rm.name,
+					prompt,
+					rm,
+					fileRefs,
+					tools: sieveTools,
+					toolPolicy,
+					includeUsage: includeStreamUsage,
+					promptTokens,
+					signal,
+				});
+				stageLog.log("openai_chat_stream_generate", generationStart, {
+					model: rm.name,
+					promptTokens,
+					fileRefs: fileRefs ? fileRefs.length : 0,
+					tools: sieveTools.openAIFunctionTools.length,
+				});
+			},
+			{
+				onError: (write, e) =>
+					writeOpenAIChatStreamError(write, cid, rm.name, e),
+			},
+		);
+	}
+
+	const generated = await generateOpenAICompletionFinalize({
+		cfg,
+		provider,
+		stage: "openai_chat",
+		logLabel: "openai chat",
+		stageLog,
+		input: { prompt, rm, fileRefs },
+		options: {
+			tools,
+			noneModeTools: bundle,
+			promptToolChoice,
+			structured,
+			toolPolicy,
+		},
+		okLogFields: (out) => ({
+			completionChars: out.length,
+			promptTokens,
+			fileRefs: fileRefs ? fileRefs.length : 0,
+		}),
+	});
+	if (generated.response) return generated.response;
+	const { text, toolCalls } = generated.turn;
+	const msg: Record<string, unknown> = {
+		role: "assistant",
+		content: text || null,
+	};
+	if (toolCalls) msg.tool_calls = toolCalls;
+	const finish = toolCalls ? "tool_calls" : "stop";
+
+	const payload: Record<string, unknown> = {
+		id: cid,
+		object: "chat.completion",
+		created: nowSec(),
+		model: rm.name,
+		choices: [{ index: 0, message: msg, finish_reason: finish }],
+		usage: openAIChatUsageFromCompletionTokens(promptTokens, tokenEst(text)),
+	};
+	return jsonResponse(payload);
+}
+
+async function handleImageGenerationChat(
+	req: UnknownRecord,
+	cfg: RuntimeConfig,
+	provider: CompletionProvider,
+	forced: boolean,
+	messages: ReturnType<typeof parseOpenAIMessages>,
+): Promise<Response> {
+	return runImageGenerationCompletion({
+		req,
+		cfg,
+		provider,
+		route: "chat",
+		messages,
+		forced,
+		stage: "openai_chat_image",
+		logLabel: "openai chat image",
+		format: (rich, promptTokens, rm) => {
+			const content = imageGenerationChatContent(rich.text, rich.images);
+			const completionTokens = tokenEst(rich.text);
+			return jsonResponse({
+				id: `chatcmpl-${randHex(12)}`,
+				object: "chat.completion",
+				created: nowSec(),
+				model: rm.name,
+				choices: [
+					{
+						index: 0,
+						message: { role: "assistant", content },
+						finish_reason: "stop",
+					},
+				],
+				usage: openAIChatUsageFromCompletionTokens(
+					promptTokens,
+					completionTokens,
+				),
+			});
+		},
+	});
+}

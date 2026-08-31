@@ -1,0 +1,52 @@
+import { describe, test } from "vitest";
+import {
+	makeSapisidHash,
+	resetSapisidHashCacheForTest,
+} from "../../../src/gemini/auth";
+import { assert } from "../assertions.js";
+import { withPatchedGlobal } from "../_support/globals.js";
+
+describe("Gemini SAPISID authorization", () => {
+	test.sequential("builds and caches SAPISIDHASH authorization headers", async () => {
+		resetSapisidHashCacheForTest();
+		const originalNow = Date.now;
+		Date.now = () => 1_700_000_000_000;
+		let digestCalls = 0;
+		let digestInput = "";
+		try {
+			await withPatchedGlobal(
+				"crypto",
+				{
+					subtle: {
+						async digest(algorithm: AlgorithmIdentifier, data: BufferSource) {
+							digestCalls++;
+							assert.equal(algorithm, "SHA-1");
+							digestInput = new TextDecoder().decode(data);
+							const bytes = new Uint8Array(20);
+							bytes[0] = 0xab;
+							bytes[19] = 0xcd;
+							return bytes.buffer;
+						},
+					},
+				},
+				async () => {
+					const first = await makeSapisidHash("sapi-cache-test");
+					const second = await makeSapisidHash("sapi-cache-test");
+					assert.equal(
+						first,
+						"SAPISIDHASH 1700000000_ab000000000000000000000000000000000000cd",
+					);
+					assert.equal(second, first);
+					assert.equal(digestCalls, 1);
+					assert.equal(
+						digestInput,
+						"1700000000 sapi-cache-test https://gemini.google.com",
+					);
+				},
+			);
+		} finally {
+			Date.now = originalNow;
+			resetSapisidHashCacheForTest();
+		}
+	});
+});
